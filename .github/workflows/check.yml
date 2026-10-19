@@ -1,0 +1,86 @@
+name: Check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    # Weekly, so GitHub does not pause the schedule after 60 days without a commit.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: check
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ASSIGNEE: ${{ vars.ASSIGNEE || 'oblivisheee' }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Check
+        run: |
+          failed=""
+          check() {
+            name="$1"; shift
+            for attempt in 1 2 3; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$@")"
+              [ "$code" = 200 ] && return 0
+              [ "$attempt" = 3 ] || sleep 20
+            done
+            failed="${failed}- **${name}**: answered \`${code}\` three times in a row (\`${*: -1}\`)"$'\n'
+          }
+          check API https://api.dexra.dev/health
+          check MCP -X POST -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' https://api.dexra.dev/mcp
+          check Site https://dexra.dev/
+
+          notify() {
+            if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+              curl -s -o /dev/null --max-time 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=$1" || true
+            fi
+          }
+
+          gh label create outage --color d73a4a --description "Dexra is down" 2>/dev/null || true
+          open="$(gh issue list --label outage --state open --json number,createdAt -q '.[0] | "\(.number) \(.createdAt)"')"
+          now="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          if [ -n "$failed" ]; then
+            printf 'Down:\n%s' "$failed"
+            if [ -z "$open" ]; then
+              url="$(gh issue create --label outage --assignee "$ASSIGNEE" \
+                --title "Down since $now" \
+                --body "$(printf 'Checked from GitHub Actions at %s:\n\n%s\nThis issue closes by itself when every check passes again.' "$now" "$failed")")"
+              notify "Dexra is down: $(printf '%s' "$failed" | tr -d '*`') $url"
+            fi
+          elif [ -n "$open" ]; then
+            number="${open%% *}"
+            since="$(date -u -d "${open#* }" +%s)"
+            minutes="$(( ($(date -u +%s) - since) / 60 ))"
+            gh issue close "$number" --comment "Back up at $now, about $minutes minutes after the first failed check."
+            notify "Dexra is back up after about $minutes minutes: https://github.com/$GH_REPO/issues/$number"
+            echo "Back up"
+          else
+            echo "Up"
+          fi
+
+  keepalive:
+    if: github.event.schedule == '0 6 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit
+        run: |
+          git config user.name "dexra-status"
+          git config user.email "dexra-status@users.noreply.github.com"
+          date -u +%Y-%m-%d > last-week
+          git add last-week
+          git commit -m "Keep the scheduled check running"
+          git push
